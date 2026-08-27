@@ -1,0 +1,11 @@
+{
+  "name": "painel-consultas",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Painel de consultas com login por conta e dados salvos na nuvem (Netlify Blobs).",
+  "dependencies": {
+    "@netlify/blobs": "^8.1.0",
+    "bcryptjs": "^2.4.3",
+    "jsonwebtoken": "^9.0.2"
+  }
+}

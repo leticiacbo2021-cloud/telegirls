@@ -1,0 +1,323 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Painel de Consultas</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="./styles.css" />
+    <script>
+      (function () {
+        try {
+          var saved = localStorage.getItem("theme");
+          var theme =
+            saved === "dark" || saved === "light"
+              ? saved
+              : window.matchMedia("(prefers-color-scheme: dark)").matches
+              ? "dark"
+              : "light";
+          document.documentElement.setAttribute("data-theme", theme);
+        } catch (err) {
+          document.documentElement.setAttribute("data-theme", "light");
+        }
+      })();
+    </script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script defer src="./app.js"></script>
+  </head>
+  <body>
+    <div class="bg-orb orb-1"></div>
+    <div class="bg-orb orb-2"></div>
+
+    <!-- ── Tela de login / cadastro ─────────────────────────────────────── -->
+    <section id="auth-screen" class="auth-screen">
+      <article class="auth-card">
+        <p class="eyebrow">Acesso</p>
+        <h1>Painel de Consultas</h1>
+        <p class="subtitle">Acesso restrito ao grupo. Seus dados ficam salvos na sua conta.</p>
+
+        <div class="auth-grid">
+          <form id="login-form" class="auth-form">
+            <label>
+              E-mail
+              <input id="login-email" type="email" required autocomplete="email" />
+            </label>
+            <label>
+              Senha
+              <span class="password-field">
+                <input id="login-password" type="password" required autocomplete="current-password" />
+                <button type="button" class="password-toggle" aria-label="Mostrar senha">👁</button>
+              </span>
+            </label>
+            <button type="submit" class="auth-submit-btn">Entrar</button>
+            <p class="auth-switch-row">
+              Não tem conta?
+              <button id="show-register-btn" class="auth-switch-btn" type="button">Cadastre-se</button>
+            </p>
+          </form>
+
+          <form id="register-form" class="auth-form hidden">
+            <label>
+              E-mail
+              <input id="register-email" type="email" required autocomplete="email" />
+            </label>
+            <label>
+              Senha <span class="hint-inline">(mínimo 8 caracteres)</span>
+              <span class="password-field">
+                <input id="register-password" type="password" minlength="8" required autocomplete="new-password" />
+                <button type="button" class="password-toggle" aria-label="Mostrar senha">👁</button>
+              </span>
+            </label>
+            <button type="submit" class="auth-submit-btn">Criar conta</button>
+            <p class="auth-switch-row">
+              Já tem conta?
+              <button id="show-login-btn" class="auth-switch-btn" type="button">Entrar</button>
+            </p>
+          </form>
+        </div>
+        <p id="auth-message" class="metric-hint"></p>
+      </article>
+    </section>
+
+    <button id="theme-toggle" class="theme-toggle" type="button" aria-pressed="false">
+      <span id="theme-toggle-icon">🌙</span>
+    </button>
+
+    <!-- ── App ──────────────────────────────────────────────────────────── -->
+    <main id="app-shell" class="app-shell hidden">
+      <header class="hero">
+        <div class="session-bar">
+          <p id="session-user-label"></p>
+          <p id="sync-status-label" class="sync-status idle">Salvamento: aguardando</p>
+          <button id="change-password-btn" class="ghost" type="button">Trocar senha</button>
+          <button id="logout-btn" class="ghost" type="button">Sair</button>
+        </div>
+        <div>
+          <p class="eyebrow">Painel diário</p>
+          <h1>Controle de atendimentos e faturamento</h1>
+          <p class="subtitle">Registre o atendimento pelo tipo, acompanhe o faturamento do dia e do mês.</p>
+        </div>
+      </header>
+
+      <section class="actions card">
+        <h2>Registrar atendimento</h2>
+        <label class="atestado-check">
+          <input id="atestado-checkbox" type="checkbox" />
+          Marcar este atendimento como "com atestado"
+        </label>
+        <div id="consult-type-grid" class="btn-grid"></div>
+        <div class="action-row">
+          <button id="undo-btn" class="ghost" type="button">Desfazer último do dia selecionado</button>
+        </div>
+        <details class="price-settings-box">
+          <summary>Ajustar valores (Adulto, Pediatria, One)</summary>
+          <form id="type-prices-form" class="type-prices-form">
+            <label>
+              Adulto (R$)
+              <input id="price-adulto" type="number" min="0" step="0.5" />
+            </label>
+            <label>
+              Pediatria (R$)
+              <input id="price-pediatria" type="number" min="0" step="0.5" />
+            </label>
+            <label>
+              One (R$)
+              <input id="price-one" type="number" min="0" step="0.5" />
+            </label>
+          </form>
+          <p class="metric-hint">
+            O Plantão é calculado automaticamente pelo horário do registro — veja as faixas abaixo.
+          </p>
+        </details>
+        <details class="price-settings-box">
+          <summary>Ver faixas de preço do Plantão</summary>
+          <div class="plantao-help">
+            <p><strong>M</strong> (07:00–13:00): 30 primeiros por R$ 20, depois R$ 15.</p>
+            <p><strong>T</strong> (13:00–19:00): 30 primeiros por R$ 20, depois R$ 15.</p>
+            <p><strong>Reforço</strong> (19:00–00:00): 25 primeiros por R$ 20, depois R$ 15.</p>
+            <p><strong>Noturno</strong> (00:00–07:00): 25 primeiros por R$ 28, depois R$ 15.</p>
+            <p class="metric-hint">A contagem de cada faixa reinicia todo dia.</p>
+          </div>
+        </details>
+        <details class="price-settings-box">
+          <summary>Adicionar atendimento manual (outra data/hora)</summary>
+          <form id="manual-form" class="manual-form">
+            <label>
+              Data
+              <input id="manual-date" type="date" required />
+            </label>
+            <label>
+              Hora
+              <input id="manual-time" type="time" required />
+            </label>
+            <label>
+              Tipo
+              <select id="manual-type" required>
+                <option value="adulto">Adulto</option>
+                <option value="pediatria">Pediatria</option>
+                <option value="one">One</option>
+                <option value="plantao">Plantão</option>
+              </select>
+            </label>
+            <label class="manual-check">
+              <input id="manual-atestado" type="checkbox" />
+              Com atestado
+            </label>
+            <button type="submit" class="ghost">Salvar manual</button>
+          </form>
+        </details>
+      </section>
+
+      <section id="metrics-grid" class="metrics-grid">
+        <article class="metric card">
+          <p class="metric-label">Data selecionada</p>
+          <p id="selected-date-label" class="metric-value"></p>
+        </article>
+        <article class="metric card">
+          <p class="metric-label">Total de atendimentos</p>
+          <p id="total-count" class="metric-value"></p>
+        </article>
+        <article class="metric card">
+          <p class="metric-label">Faturamento do dia</p>
+          <p id="total-revenue" class="metric-value"></p>
+        </article>
+        <article class="metric card">
+          <p class="metric-label">R$/hora (bruta)</p>
+          <p id="gross-revenue-per-hour" class="metric-value"></p>
+          <p class="metric-hint">Faturamento dividido pelo tempo entre o 1º e o último atendimento.</p>
+        </article>
+        <article class="metric card">
+          <p class="metric-label">Atendimentos/hora (bruta)</p>
+          <p id="gross-consults-per-hour" class="metric-value"></p>
+        </article>
+        <article class="metric card">
+          <p class="metric-label">% com atestado</p>
+          <p id="atestado-rate" class="metric-value"></p>
+        </article>
+      </section>
+
+      <section class="split-layout">
+        <article class="card">
+          <div class="card-head">
+            <h2>Detalhe do dia</h2>
+            <p id="type-breakdown"></p>
+          </div>
+          <canvas id="day-chart" height="180"></canvas>
+          <h3>Registros do dia</h3>
+          <ul id="day-list" class="day-list"></ul>
+        </article>
+
+        <article class="card">
+          <div class="calendar-head">
+            <button id="prev-month" class="ghost" type="button">◀</button>
+            <h2 id="calendar-title"></h2>
+            <button id="next-month" class="ghost" type="button">▶</button>
+          </div>
+          <div class="weekdays">
+            <span>Seg</span><span>Ter</span><span>Qua</span><span>Qui</span><span>Sex</span><span>Sáb</span
+            ><span>Dom</span>
+          </div>
+          <div id="calendar-grid" class="calendar-grid"></div>
+          <section class="month-goal-panel">
+            <h3 id="month-goal-title">Meta do mês</h3>
+            <label class="target-hours month-goal-input-wrap">
+              <span>Meta do mês (R$)</span>
+              <input id="monthly-target" type="number" min="0" step="50" />
+            </label>
+            <div class="month-goal-grid">
+              <article class="month-goal-card">
+                <p class="metric-label">Meta do mês</p>
+                <p id="month-goal-value" class="metric-value"></p>
+                <p id="month-goal-achieved" class="metric-hint"></p>
+              </article>
+              <article class="month-goal-card">
+                <p class="metric-label">Falta para meta</p>
+                <p id="month-goal-remaining" class="metric-value"></p>
+                <p id="month-goal-progress" class="metric-hint"></p>
+              </article>
+            </div>
+          </section>
+        </article>
+      </section>
+
+      <section class="charts-row">
+        <article class="card">
+          <h2>Semana (atendimentos e faturamento)</h2>
+          <canvas id="week-chart" height="140"></canvas>
+        </article>
+        <article class="card">
+          <h2>Mês (atendimentos e faturamento)</h2>
+          <canvas id="month-chart" height="140"></canvas>
+        </article>
+      </section>
+    </main>
+
+    <!-- ── Modal: editar atendimento ────────────────────────────────────── -->
+    <div id="edit-record-modal" class="modal-overlay hidden" aria-hidden="true">
+      <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="edit-record-title">
+        <div class="modal-head">
+          <h2 id="edit-record-title">Editar atendimento</h2>
+          <button id="close-edit-record-modal" class="ghost" type="button">Fechar</button>
+        </div>
+        <form id="edit-record-form" class="manual-form">
+          <label>
+            Data
+            <input id="edit-record-date" type="date" required />
+          </label>
+          <label>
+            Hora
+            <input id="edit-record-time" type="time" required />
+          </label>
+          <label>
+            Tipo
+            <select id="edit-record-type" required>
+              <option value="adulto">Adulto</option>
+              <option value="pediatria">Pediatria</option>
+              <option value="one">One</option>
+              <option value="plantao">Plantão</option>
+            </select>
+          </label>
+          <label class="manual-check">
+            <input id="edit-record-atestado" type="checkbox" />
+            Com atestado
+          </label>
+          <label>
+            Valor (R$)
+            <input id="edit-record-price" type="number" min="0" step="0.5" required />
+          </label>
+          <div class="modal-actions">
+            <button type="submit" class="ghost">Salvar edição</button>
+            <button id="delete-record-btn" type="button" class="ghost">Excluir atendimento</button>
+          </div>
+        </form>
+      </div>
+    </div>
+
+    <!-- ── Modal: trocar senha ──────────────────────────────────────────── -->
+    <div id="password-modal" class="modal-overlay hidden" aria-hidden="true">
+      <div class="modal-card modal-card-sm" role="dialog" aria-modal="true" aria-labelledby="password-modal-title">
+        <div class="modal-head">
+          <h2 id="password-modal-title">Trocar senha</h2>
+          <button id="close-password-modal" class="ghost" type="button">Fechar</button>
+        </div>
+        <form id="password-form" class="auth-form">
+          <label>
+            Senha atual
+            <input id="current-password" type="password" required autocomplete="current-password" />
+          </label>
+          <label>
+            Nova senha <span class="hint-inline">(mínimo 8 caracteres)</span>
+            <input id="new-password" type="password" minlength="8" required autocomplete="new-password" />
+          </label>
+          <button type="submit" class="auth-submit-btn">Salvar nova senha</button>
+        </form>
+        <p id="password-message" class="metric-hint"></p>
+      </div>
+    </div>
+  </body>
+</html>
