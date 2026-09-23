@@ -3,12 +3,21 @@ const MS_HOUR = 60 * 60 * 1000;
 const MIN_CONSULTS_FOR_AVERAGE = 2;
 const DEFAULT_TYPE_PRICES = { adulto: 15, pediatria: 20, one: 20 };
 const TYPE_META = {
-  adulto: { label: "Adulto", color: "#2f855a" },
-  pediatria: { label: "Pediatria", color: "#dd6b20" },
-  one: { label: "One", color: "#1d4ed8" },
-  plantao: { label: "Plantão", color: "#0f766e" },
+  adulto: { label: "Adulto", color: "#d6336c" },
+  pediatria: { label: "Pediatria", color: "#f76e9e" },
+  one: { label: "One", color: "#9c6ade" },
+  plantao: { label: "Plantão", color: "#c2185b" },
 };
 const TYPE_KEYS = Object.keys(TYPE_META);
+
+// Alguns navegadores não zeram a rolagem horizontal da página quando o
+// usuário muda o nível de zoom (Ctrl +/-), o que deixa o conteúdo
+// (centralizado via margin:auto) parecendo "puxado" pra um lado. Forçar a
+// rolagem horizontal de volta a 0 a cada mudança de tamanho de viewport
+// (o que inclui zoom) resolve isso sem depender do navegador se corrigir sozinho.
+window.addEventListener("resize", () => {
+  if (window.scrollX !== 0) window.scrollTo(0, window.scrollY);
+});
 
 // Plantão: preço escalonado por faixa de horário. A contagem de cada faixa
 // reinicia a cada dia (primeiros N atendimentos por um valor, depois outro).
@@ -18,6 +27,46 @@ const SHIFT_PRICING = {
   t: { label: "T", startMin: 13 * 60, endMin: 19 * 60, threshold: 30, initial: 20, extra: 15 },
   reforco: { label: "Reforço", startMin: 19 * 60, endMin: 24 * 60, threshold: 25, initial: 20, extra: 15 },
 };
+// Ordem de exibição dos turnos na Escala de plantões (independe da ordem de SHIFT_PRICING).
+const SCHEDULE_SHIFT_ORDER = ["m", "t", "reforco", "noturno"];
+
+// Modo combinado M+T: quando os dois turnos estão marcados juntos no seletor
+// "Plantão ativo no registro", os atendimentos de M e T do dia compartilham
+// um único limite (60) em vez de 30 cada um separadamente.
+const MT_COMBO_PRICING = { label: "M+T", threshold: 60, initial: 20, extra: 15 };
+// Atendimento de madrugada (00:00–07:00) SEM o turno Noturno marcado manualmente:
+// fica em R$ 20 fixo (sem escalonar pra R$ 28), porque a diária de R$ 28 exige
+// Noturno marcado. Conta numa faixa própria ("noturno_auto"), separada da faixa
+// oficial do Noturno marcado — assim um atendimento não-marcado nunca consome
+// o limite de 25 atendimentos da diária de R$ 28.
+const AUTO_NOTURNO_PRICING = { label: "Noturno (automático)", threshold: Infinity, initial: 20, extra: 20 };
+function getPricingConfigForGroup(group) {
+  if (group === "mt") return MT_COMBO_PRICING;
+  if (group === "noturno_auto") return AUTO_NOTURNO_PRICING;
+  return SHIFT_PRICING[group];
+}
+// Decide o turno de exibição (category) e o "grupo de preço" (pricingGroup)
+// de um atendimento de plantão, considerando o turno travado manualmente
+// no momento do registro (forcedShiftCategory: "m" | "t" | "mt" | "reforco" | "noturno" | null).
+function resolvePlantaoAssignment(ts, forcedShiftCategory) {
+  const autoCategory = getShiftCategoryForTs(ts);
+  const autoGroup = autoCategory === "noturno" ? "noturno_auto" : autoCategory;
+  if (!forcedShiftCategory) {
+    return { category: autoCategory, pricingGroup: autoGroup, manual: false };
+  }
+  if (forcedShiftCategory === "mt") {
+    if (autoCategory === "m" || autoCategory === "t") {
+      return { category: autoCategory, pricingGroup: "mt", manual: true };
+    }
+    // Fora da janela 07:00–19:00 (ex.: registro manual em outro horário com M+T ainda
+    // marcados): ignora a combinação e usa o turno normal pelo horário.
+    return { category: autoCategory, pricingGroup: autoGroup, manual: false };
+  }
+  if (SHIFT_PRICING[forcedShiftCategory]) {
+    return { category: forcedShiftCategory, pricingGroup: forcedShiftCategory, manual: true };
+  }
+  return { category: autoCategory, pricingGroup: autoGroup, manual: false };
+}
 
 // ── Estado ──────────────────────────────────────────────────────────────────
 const state = {
@@ -26,11 +75,28 @@ const state = {
   selectedDateKey: toDayKey(new Date()),
   calendarCursor: startOfMonth(new Date()),
   editingRecordId: null,
+  // Turno travado manualmente para o registro do Plantão via botão rápido.
+  // null = automático, calculado pelo horário atual (getShiftCategoryForTs).
+  manualShiftOverride: null,
+  // Escala de plantões: visão de calendário dedicada aos turnos de Plantão.
+  scheduleView: "month", // "month" | "week"
+  scheduleCursor: startOfMonth(new Date()),
+  scheduleSelectedDayKey: null,
   charts: { day: null, week: null, month: null },
   saveTimer: null,
   saveInFlight: false,
   saveDirtyAgain: false,
+  dirtyDays: new Set(),
+  dirtySettings: false,
+  yearlySummaryYear: new Date().getFullYear(),
 };
+
+// Marca só o(s) dia(s) realmente alterados nesta sessão, para que o
+// salvamento envie apenas essas mudanças em vez da árvore de dados inteira —
+// isso evita que uma aba com dados desatualizados apague dias que foram
+// registrados em outra aba/dispositivo.
+function markDayDirty(dayKey) { state.dirtyDays.add(dayKey); }
+function markSettingsDirty() { state.dirtySettings = true; }
 
 function emptyData() {
   return {
@@ -38,6 +104,9 @@ function emptyData() {
     settings: {
       typePrices: { ...DEFAULT_TYPE_PRICES },
       monthlyGoals: {},
+      // Planejamento pessoal de plantões futuros: dayKey -> ["m","t",...].
+      // É só um lembrete visual na Escala — não afeta preço nem contagem.
+      plantaoPlan: {},
     },
   };
 }
@@ -68,7 +137,16 @@ function toTimeInputValue(ts) {
   return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
 }
 function startOfMonth(date) { return new Date(date.getFullYear(), date.getMonth(), 1); }
+function startOfWeek(date) {
+  const offset = (date.getDay() + 6) % 7; // semana começa na segunda
+  const start = new Date(date);
+  start.setDate(date.getDate() - offset);
+  return start;
+}
 function formatCurrency(v) { return v.toLocaleString("pt-BR", { style: "currency", currency: "BRL" }); }
+function escapeHtml(str) {
+  return String(str ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
 function formatCalendarRevenue(v) {
   if (v <= 0) return "-";
   if (v >= 1000) return `R$ ${(v / 1000).toFixed(1).replace(".", ",")}k`;
@@ -88,17 +166,34 @@ function formatRateCurrency(v) { return v === null ? "Sem base" : formatCurrency
 function formatRateNumber(v) { return v === null ? "Sem base" : v.toFixed(2); }
 function isToday(dayKey) { return dayKey === toDayKey(new Date()); }
 
-// ── Tema claro/escuro ───────────────────────────────────────────────────────
-const CHART_PALETTE = {
-  light: { verde: "#14532d", verdeFill: "#14532d99", teal: "#0f766e", tealFill: "#0f766e99", laranja: "#ea580c" },
-  dark: { verde: "#4ade80", verdeFill: "#4ade8099", teal: "#2dd4bf", tealFill: "#2dd4bf99", laranja: "#fb923c" },
+// ── Tema claro/escuro + paleta de cores ────────────────────────────────────
+const PALETTES = {
+  rosa: {
+    light: { verde: "#b5175f", verdeFill: "#b5175f99", teal: "#9c6ade", tealFill: "#9c6ade99", laranja: "#f76e9e" },
+    dark: { verde: "#ff8fc4", verdeFill: "#ff8fc499", teal: "#c084fc", tealFill: "#c084fc99", laranja: "#ff9dc7" },
+    types: {
+      light: { adulto: "#64113f", pediatria: "#a6195d", one: "#d9366f", plantao: "#e9688a" },
+      dark: { adulto: "#f0559f", pediatria: "#ff8fb3", one: "#c084fc", plantao: "#e0468a" },
+    },
+  },
+  violeta: {
+    light: { verde: "#1a4fa0", verdeFill: "#1a4fa099", teal: "#2f7fe0", tealFill: "#2f7fe099", laranja: "#6fb1f7" },
+    dark: { verde: "#7fb0ff", verdeFill: "#7fb0ff99", teal: "#3f7fe0", tealFill: "#3f7fe099", laranja: "#a9d8ff" },
+    types: {
+      light: { adulto: "#0f2a63", pediatria: "#1a4fa0", one: "#2f7fe0", plantao: "#6fb1f7" },
+      dark: { adulto: "#6fb1f7", pediatria: "#7fb0ff", one: "#a9d8ff", plantao: "#2f7fe0" },
+    },
+  },
 };
-const TYPE_CHART_COLORS_DARK = { adulto: "#3fbb7c", pediatria: "#f0913f", one: "#5b8cf5", plantao: "#2dd4bf" };
 function getActiveTheme() { return document.documentElement.getAttribute("data-theme") === "dark" ? "dark" : "light"; }
-function chartColor(name) { return (CHART_PALETTE[getActiveTheme()] || CHART_PALETTE.light)[name]; }
+function getActivePalette() { return document.documentElement.getAttribute("data-palette") === "violeta" ? "violeta" : "rosa"; }
+function chartColor(name) {
+  const p = PALETTES[getActivePalette()] || PALETTES.rosa;
+  return (p[getActiveTheme()] || p.light)[name];
+}
 function typeChartColor(type) {
-  if (getActiveTheme() === "dark" && TYPE_CHART_COLORS_DARK[type]) return TYPE_CHART_COLORS_DARK[type];
-  return TYPE_META[type].color;
+  const p = PALETTES[getActivePalette()] || PALETTES.rosa;
+  return (p.types[getActiveTheme()] || p.types.light)[type];
 }
 function applyChartTheme() {
   if (typeof Chart === "undefined") return;
@@ -119,6 +214,20 @@ function setupThemeToggle() {
   document.getElementById("theme-toggle-icon").textContent = getActiveTheme() === "dark" ? "☀️" : "🌙";
   document.getElementById("theme-toggle").addEventListener("click", () => {
     setTheme(getActiveTheme() === "dark" ? "light" : "dark");
+  });
+}
+function setPalette(palette) {
+  const next = palette === "violeta" ? "violeta" : "rosa";
+  document.documentElement.setAttribute("data-palette", next);
+  try { localStorage.setItem("palette", next); } catch (e) {}
+  document.getElementById("palette-toggle-icon").textContent = next === "violeta" ? "💠" : "🎨";
+  applyChartTheme();
+  if (state.user) renderAll();
+}
+function setupPaletteToggle() {
+  document.getElementById("palette-toggle-icon").textContent = getActivePalette() === "violeta" ? "💠" : "🎨";
+  document.getElementById("palette-toggle").addEventListener("click", () => {
+    setPalette(getActivePalette() === "violeta" ? "rosa" : "violeta");
   });
 }
 
@@ -155,10 +264,29 @@ function scheduleSave() {
 async function flushSave() {
   if (!state.user) return;
   if (state.saveInFlight) { state.saveDirtyAgain = true; return; }
+  if (!state.dirtyDays.size && !state.dirtySettings) return;
   state.saveInFlight = true;
   setSyncStatus("saving", "Salvamento: enviando...");
+
+  // Envia só os dias e/ou configurações que mudaram nesta sessão — nunca a
+  // árvore de dados inteira. Assim, uma aba com dados desatualizados nunca
+  // apaga dias registrados em outra aba/dispositivo.
+  const daysPayload = {};
+  const removedDays = [];
+  for (const dayKey of state.dirtyDays) {
+    const records = state.data.days[dayKey];
+    if (records && records.length) daysPayload[dayKey] = records;
+    else removedDays.push(dayKey);
+  }
+  const body = { days: daysPayload, removedDays };
+  if (state.dirtySettings) body.settings = state.data.settings;
+
+  const savedDays = new Set(state.dirtyDays);
+  const savedSettings = state.dirtySettings;
   try {
-    await api("/data/save", { method: "POST", body: { data: state.data } });
+    await api("/data/save", { method: "POST", body });
+    for (const dayKey of savedDays) state.dirtyDays.delete(dayKey);
+    if (savedSettings) state.dirtySettings = false;
     setSyncStatus("saved", "Salvamento: tudo salvo");
   } catch (err) {
     setSyncStatus("error", "Falha ao salvar. Tentando de novo...");
@@ -185,19 +313,38 @@ function getShiftCategoryForTs(ts) {
   return "noturno";
 }
 // Recalcula o preço de TODOS os registros de plantão de um dia (a contagem da
-// faixa depende da ordem cronológica dos atendimentos daquele dia).
+// faixa depende da ordem cronológica dos atendimentos daquele dia). Registros
+// marcados com plantaoManual mantêm o turno travado manualmente em vez de
+// recalcular pelo horário — mas ainda entram na contagem daquele turno.
 function recalcPlantaoPricingForDay(dayKey) {
   const records = getDayRecords(dayKey);
   if (!records.length) return;
+  markDayDirty(dayKey);
   records.sort((a, b) => a.ts - b.ts);
-  const counters = { noturno: 0, m: 0, t: 0, reforco: 0 };
+  // "mt" é um contador à parte (modo combinado M+T) e "noturno_auto" é a
+  // madrugada sem o turno Noturno marcado manualmente (R$ 20 fixo, não entra
+  // na faixa oficial de 25 atendimentos a R$ 28 do Noturno marcado).
+  const counters = { noturno: 0, noturno_auto: 0, m: 0, t: 0, reforco: 0, mt: 0 };
   for (const record of records) {
     if (record.type !== "plantao") continue;
-    const category = getShiftCategoryForTs(record.ts);
-    counters[category] += 1;
-    const cfg = SHIFT_PRICING[category];
+    const autoCategory = getShiftCategoryForTs(record.ts);
+    let category;
+    let group;
+    if (record.plantaoManual && record.plantaoPricingGroup === "mt") {
+      category = autoCategory;
+      group = "mt";
+    } else if (record.plantaoManual && SHIFT_PRICING[record.plantaoPricingGroup]) {
+      category = record.plantaoPricingGroup;
+      group = record.plantaoPricingGroup;
+    } else {
+      category = autoCategory;
+      group = autoCategory === "noturno" ? "noturno_auto" : autoCategory;
+    }
+    counters[group] += 1;
+    const cfg = getPricingConfigForGroup(group);
     record.plantaoCategory = category;
-    record.price = counters[category] <= cfg.threshold ? cfg.initial : cfg.extra;
+    record.plantaoPricingGroup = group;
+    record.price = counters[group] <= cfg.threshold ? cfg.initial : cfg.extra;
   }
 }
 function getTypeDisplayLabel(record) {
@@ -208,17 +355,27 @@ function getTypeDisplayLabel(record) {
   return base;
 }
 // Preço que o botão de registro mostraria agora, simulando a inclusão do
-// próximo atendimento de plantão no dia selecionado.
+// próximo atendimento de plantão no dia selecionado. Respeita o turno
+// travado manualmente em "Plantão ativo no registro" (inclusive o modo
+// combinado M+T), se houver.
 function getPendingPlantaoPrice() {
   const now = Date.now();
-  const category = getShiftCategoryForTs(now);
   const dayKey = toDayKey(new Date(now));
-  const cfg = SHIFT_PRICING[category];
+  const autoCategory = getShiftCategoryForTs(now);
+  let category = autoCategory;
+  let group = autoCategory === "noturno" ? "noturno_auto" : autoCategory;
+  if (state.manualShiftOverride === "mt" && (autoCategory === "m" || autoCategory === "t")) {
+    group = "mt";
+  } else if (state.manualShiftOverride && SHIFT_PRICING[state.manualShiftOverride]) {
+    category = state.manualShiftOverride;
+    group = state.manualShiftOverride;
+  }
+  const cfg = getPricingConfigForGroup(group);
   const countSoFar = getDayRecords(dayKey).filter(
-    (r) => r.type === "plantao" && r.plantaoCategory === category
+    (r) => r.type === "plantao" && r.plantaoPricingGroup === group
   ).length;
   const nextIndex = countSoFar + 1;
-  return { category, price: nextIndex <= cfg.threshold ? cfg.initial : cfg.extra };
+  return { category, group, price: nextIndex <= cfg.threshold ? cfg.initial : cfg.extra };
 }
 
 // ── Preços dos demais tipos ─────────────────────────────────────────────────
@@ -235,19 +392,28 @@ function getRecordPrice(record) { return Number(record.price) || 0; }
 // ── Dados do dia / registros ────────────────────────────────────────────────
 function getDayRecords(dayKey) { return state.data.days[dayKey] || []; }
 
-function addRecord(dayKey, ts, type, atestado) {
+// forcedShiftCategory (opcional): quando informado para um registro de
+// Plantão, trava o turno naquele valor (vindo do seletor "Plantão ativo no
+// registro") em vez de calculá-lo automaticamente pelo horário.
+function addRecord(dayKey, ts, type, atestado, name, forcedShiftCategory) {
   if (!state.data.days[dayKey]) state.data.days[dayKey] = [];
   const prices = getTypePrices();
+  const isPlantao = type === "plantao";
+  const assignment = isPlantao ? resolvePlantaoAssignment(ts, forcedShiftCategory) : null;
   const record = {
     id: createId(),
     type,
     ts,
     atestado: atestado === true,
-    price: type === "plantao" ? 0 : prices[type] || 0,
-    plantaoCategory: type === "plantao" ? getShiftCategoryForTs(ts) : null,
+    price: isPlantao ? 0 : prices[type] || 0,
+    plantaoCategory: isPlantao ? assignment.category : null,
+    plantaoPricingGroup: isPlantao ? assignment.pricingGroup : null,
+    plantaoManual: isPlantao ? assignment.manual : false,
+    name: typeof name === "string" ? name.trim().slice(0, 80) : "",
   };
   state.data.days[dayKey].push(record);
-  if (type === "plantao") recalcPlantaoPricingForDay(dayKey);
+  markDayDirty(dayKey);
+  if (isPlantao) recalcPlantaoPricingForDay(dayKey);
   return record;
 }
 
@@ -258,6 +424,7 @@ function deleteRecordById(recordId) {
     records.splice(idx, 1);
     if (!records.length) delete state.data.days[dayKey];
     else recalcPlantaoPricingForDay(dayKey);
+    markDayDirty(dayKey);
     return dayKey;
   }
   return null;
@@ -294,6 +461,7 @@ function computeDayMetrics(dayKey) {
     totalClockHours,
     grossRevenuePerHour: hasSample && totalClockHours > 0 ? revenue / totalClockHours : null,
     grossConsultationsPerHour: hasSample && totalClockHours > 0 ? total / totalClockHours : null,
+    avgTicket: total > 0 ? revenue / total : null,
   };
 }
 
@@ -314,6 +482,189 @@ function computeMonthMetrics(monthKey) {
 
 function getMonthRevenue(monthKey) { return computeMonthMetrics(monthKey).revenue; }
 
+// Totais de atestado do mês, gerais e por tipo de atendimento (Adulto,
+// Pediatria, ONE, Plantão). Usado pelo painel "Atendimentos com e sem
+// atestado no mês".
+function computeMonthAtestadoSummary(monthKey) {
+  const perType = {};
+  for (const t of TYPE_KEYS) perType[t] = { com: 0, sem: 0 };
+  let totalCom = 0;
+  let totalSem = 0;
+  for (const [dayKey, records] of Object.entries(state.data.days)) {
+    if (!dayKey.startsWith(`${monthKey}-`)) continue;
+    for (const r of records) {
+      if (r.atestado) { perType[r.type].com += 1; totalCom += 1; }
+      else { perType[r.type].sem += 1; totalSem += 1; }
+    }
+  }
+  return { perType, totalCom, totalSem, totalAll: totalCom + totalSem };
+}
+
+// Resumo dos atendimentos de Plantão de um dia, agrupados por turno (M/T/Reforço/Noturno).
+// Usado pela Escala de plantões — não afeta o cálculo de preço, só exibe o que já está salvo.
+function computeDayPlantaoBreakdown(dayKey) {
+  const breakdown = {};
+  for (const key of Object.keys(SHIFT_PRICING)) breakdown[key] = { count: 0, revenue: 0 };
+  const records = getDayRecords(dayKey).filter((r) => r.type === "plantao");
+  for (const r of records) {
+    const cat = r.plantaoCategory && SHIFT_PRICING[r.plantaoCategory] ? r.plantaoCategory : getShiftCategoryForTs(r.ts);
+    breakdown[cat].count += 1;
+    breakdown[cat].revenue += getRecordPrice(r);
+  }
+  const total = records.length;
+  const revenue = records.reduce((s, r) => s + getRecordPrice(r), 0);
+  return { breakdown, total, revenue };
+}
+
+// Todos os registros de um mês, ordenados cronologicamente.
+function getMonthRecords(monthKey) {
+  const records = [];
+  for (const [dayKey, dayRecords] of Object.entries(state.data.days)) {
+    if (!dayKey.startsWith(`${monthKey}-`)) continue;
+    for (const r of dayRecords) records.push(r);
+  }
+  records.sort((a, b) => a.ts - b.ts);
+  return records;
+}
+
+// Todos os meses (YYYY-MM) que têm ao menos um atendimento registrado.
+function getMonthsWithData() {
+  const set = new Set();
+  for (const dayKey of Object.keys(state.data.days)) {
+    if (state.data.days[dayKey]?.length) set.add(monthKeyFromDayKey(dayKey));
+  }
+  return [...set].sort().reverse();
+}
+
+// ── Resumo anual ─────────────────────────────────────────────────────────────
+const MONTH_LABELS = [
+  "Janeiro", "Fevereiro", "Março", "Abril", "Maio", "Junho",
+  "Julho", "Agosto", "Setembro", "Outubro", "Novembro", "Dezembro",
+];
+
+function renderYearlySummary() {
+  const year = state.yearlySummaryYear;
+  document.getElementById("yearly-summary-year-label").textContent = String(year);
+  const body = document.getElementById("yearly-summary-body");
+  body.innerHTML = "";
+
+  let yearTotal = 0;
+  let yearCount = 0;
+  for (let m = 1; m <= 12; m += 1) {
+    const monthKey = `${year}-${String(m).padStart(2, "0")}`;
+    const metrics = computeMonthMetrics(monthKey);
+    yearTotal += metrics.revenue;
+    yearCount += metrics.total;
+
+    const tr = document.createElement("tr");
+    if (!metrics.total) tr.classList.add("is-empty-month");
+    tr.innerHTML = `
+      <td>${MONTH_LABELS[m - 1]}</td>
+      <td>${metrics.total}</td>
+      <td>${formatCurrency(metrics.revenue)}</td>
+    `;
+    body.appendChild(tr);
+  }
+
+  document.getElementById("yearly-summary-total-count").textContent = String(yearCount);
+  document.getElementById("yearly-summary-total-revenue").textContent = formatCurrency(yearTotal);
+
+  const select = document.getElementById("export-month-select");
+  const previousValue = select.value;
+  const monthsWithData = getMonthsWithData();
+  const currentMonthKey = monthKeyFromDayKey(state.selectedDateKey);
+  const options = monthsWithData.length ? monthsWithData : [currentMonthKey];
+  select.innerHTML = options.map((mk) => `<option value="${mk}">${formatMonthLong(mk)}</option>`).join("");
+  if (options.includes(previousValue)) select.value = previousValue;
+  else if (options.includes(currentMonthKey)) select.value = currentMonthKey;
+}
+
+function openYearlySummaryModal() {
+  state.yearlySummaryYear = parseDayKey(state.selectedDateKey).getFullYear();
+  renderYearlySummary();
+  const overlay = document.getElementById("yearly-summary-modal");
+  overlay.classList.remove("hidden");
+  overlay.setAttribute("aria-hidden", "false");
+}
+function closeYearlySummaryModal() {
+  const overlay = document.getElementById("yearly-summary-modal");
+  overlay.classList.add("hidden");
+  overlay.setAttribute("aria-hidden", "true");
+}
+
+// ── Exportação de atendimentos do mês ───────────────────────────────────────
+function downloadBlob(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+function csvEscape(value) {
+  const str = String(value ?? "");
+  return /[;"\n]/.test(str) ? `"${str.replace(/"/g, '""')}"` : str;
+}
+
+function exportMonthCSV(monthKey) {
+  const records = getMonthRecords(monthKey);
+  const rows = [["Data", "Hora", "Nome do paciente", "Tipo", "Atestado", "Valor (R$)"]];
+  let total = 0;
+  for (const r of records) {
+    total += getRecordPrice(r);
+    rows.push([
+      toDayKey(new Date(r.ts)).split("-").reverse().join("/"),
+      toTimeInputValue(r.ts),
+      r.name || "",
+      getTypeDisplayLabel(r),
+      r.atestado ? "Sim" : "Não",
+      getRecordPrice(r).toFixed(2).replace(".", ","),
+    ]);
+  }
+  rows.push([]);
+  rows.push(["", "", "", "", "Total", total.toFixed(2).replace(".", ",")]);
+  const csv = "\uFEFF" + rows.map((row) => row.map(csvEscape).join(";")).join("\r\n");
+  downloadBlob(new Blob([csv], { type: "text/csv;charset=utf-8" }), `atendimentos-${monthKey}.csv`);
+}
+
+function exportMonthPDF(monthKey) {
+  if (!window.jspdf?.jsPDF) {
+    alert("Não foi possível carregar o gerador de PDF. Verifique sua conexão e tente novamente.");
+    return;
+  }
+  const { jsPDF } = window.jspdf;
+  const doc = new jsPDF();
+  const records = getMonthRecords(monthKey);
+  const total = records.reduce((s, r) => s + getRecordPrice(r), 0);
+
+  doc.setFontSize(14);
+  doc.text(`Atendimentos — ${formatMonthLong(monthKey)}`, 14, 16);
+  doc.setFontSize(10);
+  doc.text(`${records.length} atendimento${records.length === 1 ? "" : "s"} · Faturamento total: ${formatCurrency(total)}`, 14, 23);
+
+  doc.autoTable({
+    startY: 28,
+    head: [["Data", "Hora", "Nome do paciente", "Tipo", "Atestado", "Valor"]],
+    body: records.map((r) => [
+      toDayKey(new Date(r.ts)).split("-").reverse().join("/"),
+      toTimeInputValue(r.ts),
+      r.name || "—",
+      getTypeDisplayLabel(r),
+      r.atestado ? "Sim" : "Não",
+      formatCurrency(getRecordPrice(r)),
+    ]),
+    foot: [["", "", "", "", "Total", formatCurrency(total)]],
+    styles: { fontSize: 9 },
+    headStyles: { fillColor: [214, 51, 108] },
+    footStyles: { fillColor: [245, 245, 245], textColor: [20, 20, 20] },
+  });
+
+  doc.save(`atendimentos-${monthKey}.pdf`);
+}
+
 function getMonthlyGoal(monthKey) {
   const value = Number(state.data.settings.monthlyGoals?.[monthKey]);
   return Number.isFinite(value) && value >= 0 ? value : null;
@@ -322,6 +673,7 @@ function setMonthlyGoal(monthKey, value) {
   if (!state.data.settings.monthlyGoals) state.data.settings.monthlyGoals = {};
   if (value === null) delete state.data.settings.monthlyGoals[monthKey];
   else state.data.settings.monthlyGoals[monthKey] = value;
+  markSettingsDirty();
 }
 
 // ── Renderização ─────────────────────────────────────────────────────────────
@@ -330,28 +682,102 @@ function renderConsultTypeButtons() {
   grid.innerHTML = "";
   const prices = getTypePrices();
   for (const type of TYPE_KEYS) {
-    const button = document.createElement("button");
-    button.type = "button";
-    button.className = `type-btn ${type}`;
+    const card = document.createElement("div");
+    card.className = `type-card ${type}`;
+
+    const header = document.createElement("div");
+    header.className = `type-card-header ${type}`;
     if (type === "plantao") {
-      const { category, price } = getPendingPlantaoPrice();
-      button.textContent = `Plantão ${SHIFT_PRICING[category].label} (+${formatCurrency(price)})`;
+      const { category, group, price } = getPendingPlantaoPrice();
+      let shiftLabel = SHIFT_PRICING[category].label;
+      if (group === "mt") shiftLabel = `M+T (${SHIFT_PRICING[category].label})`;
+      else if (group === "noturno_auto") shiftLabel = `${SHIFT_PRICING[category].label} (auto)`;
+      header.textContent = `Plantão ${shiftLabel} (+${formatCurrency(price)})`;
     } else {
-      button.textContent = `${TYPE_META[type].label} (+${formatCurrency(prices[type])})`;
+      header.textContent = `${TYPE_META[type].label} (+${formatCurrency(prices[type])})`;
     }
-    button.addEventListener("click", () => registerConsult(type));
-    grid.appendChild(button);
+
+    const actions = document.createElement("div");
+    actions.className = "type-card-actions";
+    const semBtn = document.createElement("button");
+    semBtn.type = "button";
+    semBtn.className = "type-card-btn";
+    semBtn.textContent = "Sem atestado";
+    semBtn.addEventListener("click", () => registerConsult(type, false));
+    const comBtn = document.createElement("button");
+    comBtn.type = "button";
+    comBtn.className = "type-card-btn";
+    comBtn.textContent = "Com atestado";
+    comBtn.addEventListener("click", () => registerConsult(type, true));
+    actions.append(semBtn, comBtn);
+
+    card.append(header, actions);
+    grid.appendChild(card);
   }
 }
 
-function registerConsult(type) {
-  const now = Date.now();
-  const dayKey = toDayKey(new Date(now));
-  const atestado = document.getElementById("atestado-checkbox").checked;
-  addRecord(dayKey, now, type, atestado);
-  state.selectedDateKey = dayKey;
+// ── Seletor manual do turno ativo do Plantão ("Plantão ativo no registro") ──
+// M e T podem ficar marcados ao mesmo tempo (modo combinado M+T, com limite
+// compartilhado de 60). Reforço e Noturno continuam exclusivos: marcar um
+// deles desmarca todos os outros, e marcar M ou T desmarca Reforço/Noturno.
+// Desmarcar tudo volta ao modo automático (turno decidido pelo horário).
+function setupShiftOverride() {
+  const checks = document.querySelectorAll(".shift-override-check");
+  checks.forEach((check) => {
+    check.addEventListener("change", () => {
+      const shift = check.dataset.shift;
+      if (check.checked) {
+        if (shift === "reforco" || shift === "noturno") {
+          checks.forEach((other) => { if (other !== check) other.checked = false; });
+        } else {
+          checks.forEach((other) => {
+            if (other !== check && (other.dataset.shift === "reforco" || other.dataset.shift === "noturno")) {
+              other.checked = false;
+            }
+          });
+        }
+      }
+      const checked = [...checks].filter((c) => c.checked).map((c) => c.dataset.shift);
+      if (checked.length === 0) state.manualShiftOverride = null;
+      else if (checked.includes("m") && checked.includes("t")) state.manualShiftOverride = "mt";
+      else state.manualShiftOverride = checked[0];
+      renderConsultTypeButtons();
+    });
+  });
+}
+
+function registerConsult(type, atestado) {
+  const dayKey = state.selectedDateKey;
+  const now = new Date();
+  const [year, month, day] = dayKey.split("-").map(Number);
+  const ts = new Date(year, month - 1, day, now.getHours(), now.getMinutes(), now.getSeconds(), now.getMilliseconds()).getTime();
+  const nameInput = document.getElementById("quick-patient-name");
+  const name = nameInput ? nameInput.value : "";
+  const forcedCategory = type === "plantao" ? state.manualShiftOverride : null;
+  addRecord(dayKey, ts, type, atestado === true, name, forcedCategory);
+  if (nameInput) nameInput.value = "";
   state.calendarCursor = startOfMonth(parseDayKey(dayKey));
-  document.getElementById("atestado-checkbox").checked = false;
+  scheduleSave();
+  renderAll();
+}
+
+// Corrige o turno de TODOS os atendimentos de Plantão já registrados no dia
+// selecionado, aplicando de uma vez a marcação atual de "Plantão ativo no
+// registro" (inclusive M+T combinado, ou nenhuma = volta ao automático).
+// Útil quando o turno errado foi marcado e vários atendimentos já foram
+// lançados — evita editar um por um.
+function applyShiftOverrideToSelectedDay() {
+  const dayKey = state.selectedDateKey;
+  const records = getDayRecords(dayKey).filter((r) => r.type === "plantao");
+  if (!records.length) return;
+  const forced = state.manualShiftOverride;
+  for (const record of records) {
+    const assignment = resolvePlantaoAssignment(record.ts, forced);
+    record.plantaoCategory = assignment.category;
+    record.plantaoPricingGroup = assignment.pricingGroup;
+    record.plantaoManual = assignment.manual;
+  }
+  recalcPlantaoPricingForDay(dayKey);
   scheduleSave();
   renderAll();
 }
@@ -371,7 +797,7 @@ function renderMetrics(metrics) {
   document.getElementById("total-count").textContent = String(metrics.total);
   document.getElementById("total-revenue").textContent = formatCurrency(metrics.revenue);
   document.getElementById("gross-revenue-per-hour").textContent = formatRateCurrency(metrics.grossRevenuePerHour);
-  document.getElementById("gross-consults-per-hour").textContent = formatRateNumber(metrics.grossConsultationsPerHour);
+  document.getElementById("avg-ticket").textContent = formatRateCurrency(metrics.avgTicket);
   document.getElementById("atestado-rate").textContent =
     metrics.atestadoRate === null ? "Sem base" : `${(metrics.atestadoRate * 100).toFixed(1)}% (${metrics.atestadoCount}/${metrics.total})`;
   document.getElementById("type-breakdown").textContent =
@@ -380,6 +806,12 @@ function renderMetrics(metrics) {
 
 function renderDayList(records) {
   const list = document.getElementById("day-list");
+  const countLabel = document.getElementById("day-list-count");
+  if (countLabel) {
+    countLabel.textContent = records.length
+      ? `${records.length} registro${records.length > 1 ? "s" : ""}`
+      : "sem registros";
+  }
   list.innerHTML = "";
   if (!records.length) {
     const li = document.createElement("li");
@@ -396,6 +828,7 @@ function renderDayList(records) {
     main.className = "day-main";
     main.innerHTML = `
       <span>${formatTime(record.ts)}</span>
+      ${record.name ? `<span class="day-patient-name">${escapeHtml(record.name)}</span>` : ""}
       <span class="tag ${record.type}">${getTypeDisplayLabel(record)}</span>
       <span class="metric-hint">${formatCurrency(getRecordPrice(record))}</span>
       ${record.atestado ? '<span class="tag atestado">Atestado</span>' : ""}
@@ -475,11 +908,325 @@ function renderCalendar() {
   }
 }
 
+// ── Planejamento pessoal de plantões futuros (Escala) ───────────────────────
+// Guarda só a intenção de trabalhar tal turno em tal dia — não vira
+// atendimento nem afeta preço/contagem. Some sozinho da Escala assim que o
+// dia tiver atendimentos reais registrados (a exibição prioriza o real).
+function getPlantaoPlanForDay(dayKey) {
+  const plan = state.data.settings.plantaoPlan || {};
+  return Array.isArray(plan[dayKey]) ? plan[dayKey] : [];
+}
+function togglePlantaoPlanShift(dayKey, shift, checked) {
+  if (!state.data.settings.plantaoPlan) state.data.settings.plantaoPlan = {};
+  const plan = state.data.settings.plantaoPlan;
+  const current = new Set(plan[dayKey] || []);
+  if (checked) current.add(shift);
+  else current.delete(shift);
+  if (current.size) plan[dayKey] = SCHEDULE_SHIFT_ORDER.filter((s) => current.has(s));
+  else delete plan[dayKey];
+  markSettingsDirty();
+  scheduleSave();
+  renderScheduleGrid();
+}
+
+// ── Escala de plantões (visão dedicada por semana/mês) ──────────────────────
+function renderScheduleGrid() {
+  const grid = document.getElementById("schedule-grid");
+  const titleEl = document.getElementById("schedule-title");
+  if (!grid || !titleEl) return;
+  grid.innerHTML = "";
+
+  let start;
+  let numCells;
+  if (state.scheduleView === "week") {
+    start = startOfWeek(state.scheduleCursor);
+    numCells = 7;
+    const end = new Date(start);
+    end.setDate(start.getDate() + 6);
+    const fmt = (d) => `${String(d.getDate()).padStart(2, "0")}/${String(d.getMonth() + 1).padStart(2, "0")}`;
+    titleEl.textContent = `${fmt(start)} – ${fmt(end)}`;
+  } else {
+    const cursor = state.scheduleCursor;
+    const first = new Date(cursor.getFullYear(), cursor.getMonth(), 1);
+    start = startOfWeek(first);
+    numCells = 42;
+    const title = first.toLocaleDateString("pt-BR", { month: "long", year: "numeric" });
+    titleEl.textContent = title.charAt(0).toUpperCase() + title.slice(1);
+  }
+
+  for (let i = 0; i < numCells; i += 1) {
+    const date = new Date(start);
+    date.setDate(start.getDate() + i);
+    const key = toDayKey(date);
+    const { breakdown, total } = computeDayPlantaoBreakdown(key);
+
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "schedule-day-cell";
+    if (state.scheduleView === "month" && date.getMonth() !== state.scheduleCursor.getMonth()) btn.classList.add("other-month");
+    if (key === toDayKey(new Date())) btn.classList.add("today");
+    if (key === state.scheduleSelectedDayKey) btn.classList.add("selected");
+
+    const weekdayLabel = date.toLocaleDateString("pt-BR", { weekday: "short" }).replace(".", "").toUpperCase();
+    let tagsHtml;
+    if (total > 0) {
+      // Dia com atendimento real registrado: mostra o que de fato aconteceu.
+      tagsHtml = SCHEDULE_SHIFT_ORDER
+        .filter((cat) => breakdown[cat].count > 0)
+        .map((cat) => `<span class="schedule-shift-tag ${cat}">${SHIFT_PRICING[cat].label} ${breakdown[cat].count}</span>`)
+        .join("");
+    } else {
+      // Sem atendimento ainda: mostra o planejamento (turno tracejado), se houver.
+      const planned = getPlantaoPlanForDay(key);
+      tagsHtml = planned.length
+        ? planned.map((cat) => `<span class="schedule-shift-tag planned ${cat}">${SHIFT_PRICING[cat].label}</span>`).join("")
+        : `<span class="schedule-empty-label">Sem plantão.</span>`;
+    }
+
+    btn.innerHTML = `
+      <span class="schedule-day-head">
+        <span class="schedule-weekday">${weekdayLabel}</span>
+        <span class="schedule-daynum">${date.getDate()}</span>
+      </span>
+      <span class="schedule-date-sub">${String(date.getDate()).padStart(2, "0")}/${String(date.getMonth() + 1).padStart(2, "0")}</span>
+      <span class="schedule-tags">${tagsHtml}</span>
+    `;
+    btn.addEventListener("click", () => {
+      state.scheduleSelectedDayKey = key;
+      renderScheduleGrid();
+      renderScheduleDetail();
+    });
+    grid.appendChild(btn);
+  }
+}
+
+function renderScheduleDetail() {
+  const box = document.getElementById("schedule-detail");
+  if (!box) return;
+  const key = state.scheduleSelectedDayKey;
+  if (!key) {
+    box.innerHTML = `<p class="metric-hint">Clique em um dia para ver o detalhe da escala.</p>`;
+    return;
+  }
+  const { breakdown, total, revenue } = computeDayPlantaoBreakdown(key);
+  let body;
+  if (total === 0) {
+    body = `<p class="metric-hint">Sem plantões registrados neste dia.</p>`;
+  } else {
+    const rows = SCHEDULE_SHIFT_ORDER
+      .filter((cat) => breakdown[cat].count > 0)
+      .map(
+        (cat) =>
+          `<li><span class="tag plantao">${SHIFT_PRICING[cat].label}</span> ${breakdown[cat].count} atendimento${breakdown[cat].count > 1 ? "s" : ""} · ${formatCurrency(breakdown[cat].revenue)}</li>`
+      )
+      .join("");
+    body = `
+      <ul class="schedule-detail-list">${rows}</ul>
+      <p class="metric-hint">Total do dia: ${total} plantão${total > 1 ? "ões" : ""} · ${formatCurrency(revenue)}</p>
+    `;
+  }
+
+  const planned = getPlantaoPlanForDay(key);
+  const planChecksHtml = SCHEDULE_SHIFT_ORDER
+    .map(
+      (cat) =>
+        `<label class="schedule-plan-check"><input type="checkbox" class="schedule-plan-shift-check" data-shift="${cat}" ${planned.includes(cat) ? "checked" : ""} /> ${SHIFT_PRICING[cat].label}</label>`
+    )
+    .join("");
+
+  box.innerHTML = `
+    <div class="schedule-detail-head">
+      <strong>${formatDateLong(key)}</strong>
+      <button id="schedule-goto-day" class="ghost" type="button">Ver/editar este dia</button>
+    </div>
+    ${body}
+    <div class="schedule-plan-box">
+      <p class="schedule-plan-title">Planejamento (turnos que pretende trabalhar neste dia)</p>
+      <div class="schedule-plan-checks">${planChecksHtml}</div>
+      <p class="metric-hint">Só um lembrete visual — não afeta preço nem contagem, e some sozinho quando o dia tiver atendimentos reais.</p>
+    </div>
+  `;
+  const gotoBtn = document.getElementById("schedule-goto-day");
+  if (gotoBtn) {
+    gotoBtn.addEventListener("click", () => {
+      state.selectedDateKey = key;
+      state.calendarCursor = startOfMonth(parseDayKey(key));
+      renderAll();
+      document.querySelector(".actions.card")?.scrollIntoView({ behavior: "smooth", block: "start" });
+    });
+  }
+  document.querySelectorAll(".schedule-plan-shift-check").forEach((cb) => {
+    cb.addEventListener("change", () => togglePlantaoPlanShift(key, cb.dataset.shift, cb.checked));
+  });
+}
+
+function renderSchedule() {
+  renderScheduleGrid();
+  renderScheduleDetail();
+}
+
+function setupScheduleControls() {
+  document.getElementById("schedule-prev").addEventListener("click", () => {
+    state.scheduleCursor =
+      state.scheduleView === "week"
+        ? new Date(state.scheduleCursor.getFullYear(), state.scheduleCursor.getMonth(), state.scheduleCursor.getDate() - 7)
+        : new Date(state.scheduleCursor.getFullYear(), state.scheduleCursor.getMonth() - 1, 1);
+    renderScheduleGrid();
+  });
+  document.getElementById("schedule-next").addEventListener("click", () => {
+    state.scheduleCursor =
+      state.scheduleView === "week"
+        ? new Date(state.scheduleCursor.getFullYear(), state.scheduleCursor.getMonth(), state.scheduleCursor.getDate() + 7)
+        : new Date(state.scheduleCursor.getFullYear(), state.scheduleCursor.getMonth() + 1, 1);
+    renderScheduleGrid();
+  });
+  const weekBtn = document.getElementById("schedule-view-week");
+  const monthBtn = document.getElementById("schedule-view-month");
+  weekBtn.addEventListener("click", () => {
+    state.scheduleView = "week";
+    weekBtn.classList.add("active");
+    monthBtn.classList.remove("active");
+    renderScheduleGrid();
+  });
+  monthBtn.addEventListener("click", () => {
+    state.scheduleView = "month";
+    monthBtn.classList.add("active");
+    weekBtn.classList.remove("active");
+    renderScheduleGrid();
+  });
+}
+
+// ── Linha do tempo do dia ────────────────────────────────────────────────────
+function renderTimeline(records) {
+  const track = document.getElementById("timeline-track");
+  const emptyLabel = document.getElementById("timeline-empty-label");
+  track.innerHTML = "";
+
+  if (!records.length) {
+    emptyLabel.textContent = "Sem atendimentos registrados neste dia.";
+    track.style.width = "100%";
+    return;
+  }
+  const lastRecord = records.reduce((a, b) => (b.ts > a.ts ? b : a));
+  emptyLabel.textContent = `${records.length} atendimento${records.length > 1 ? "s" : ""} · último às ${formatTime(lastRecord.ts)}`;
+
+  const sorted = [...records].sort((a, b) => a.ts - b.ts);
+  const PAD_MIN = 30;
+  let startMin = getMinutesOfDay(sorted[0].ts) - PAD_MIN;
+  let endMin = getMinutesOfDay(sorted[sorted.length - 1].ts) + PAD_MIN;
+  startMin = Math.max(0, Math.floor(startMin / 30) * 30);
+  endMin = Math.min(24 * 60, Math.ceil(endMin / 30) * 30);
+  if (endMin - startMin < 60) endMin = Math.min(24 * 60, startMin + 60);
+  const totalMin = endMin - startMin;
+
+  const PX_PER_MIN = 4; // controla o "zoom" horizontal da linha do tempo
+  const widthPx = Math.max(totalMin * PX_PER_MIN, 320);
+  track.style.width = `${widthPx}px`;
+
+  // Marcações de hora (a cada 30 min)
+  for (let m = startMin; m <= endMin; m += 30) {
+    const tick = document.createElement("div");
+    tick.className = "timeline-tick";
+    tick.style.left = `${((m - startMin) / totalMin) * 100}%`;
+    const hh = String(Math.floor(m / 60)).padStart(2, "0");
+    const mm = String(m % 60).padStart(2, "0");
+    tick.innerHTML = `<span class="timeline-tick-label">${hh}:${mm}</span>`;
+    track.appendChild(tick);
+  }
+
+  // Bolinhas de cada atendimento
+  for (const record of sorted) {
+    const minutes = getMinutesOfDay(record.ts);
+    const dot = document.createElement("button");
+    dot.type = "button";
+    dot.className = `timeline-dot ${record.type}`;
+    dot.style.left = `${((minutes - startMin) / totalMin) * 100}%`;
+    dot.title = `${formatTime(record.ts)}${record.name ? " · " + record.name : ""} · ${getTypeDisplayLabel(record)}${record.atestado ? " · Com atestado" : ""}`;
+    if (record.atestado) dot.classList.add("has-atestado");
+    dot.addEventListener("click", () => openEditRecordModal(record.id));
+    track.appendChild(dot);
+  }
+}
+
+function setupDayListToggle() {
+  const toggle = document.getElementById("day-list-toggle");
+  const list = document.getElementById("day-list");
+  if (!toggle || !list) return;
+  let expanded = false;
+  try { expanded = localStorage.getItem("dayListExpanded") === "1"; } catch (e) {}
+  const apply = () => {
+    list.classList.toggle("is-collapsed", !expanded);
+    toggle.setAttribute("aria-expanded", String(expanded));
+  };
+  apply();
+  toggle.addEventListener("click", () => {
+    expanded = !expanded;
+    apply();
+    try { localStorage.setItem("dayListExpanded", expanded ? "1" : "0"); } catch (e) {}
+  });
+}
+
+function setupTimelineNav() {
+  const viewport = document.querySelector(".timeline-viewport");
+  document.getElementById("timeline-prev").addEventListener("click", () => {
+    viewport.scrollBy({ left: -160, behavior: "smooth" });
+  });
+  document.getElementById("timeline-next").addEventListener("click", () => {
+    viewport.scrollBy({ left: 160, behavior: "smooth" });
+  });
+}
+
+// ── Cronômetro ───────────────────────────────────────────────────────────────
+const stopwatchState = { running: false, startedAt: 0, elapsedMs: 0, timer: null };
+function formatStopwatch(ms) {
+  const totalSeconds = Math.floor(ms / 1000);
+  const mm = String(Math.floor(totalSeconds / 60)).padStart(2, "0");
+  const ss = String(totalSeconds % 60).padStart(2, "0");
+  return `${mm}:${ss}`;
+}
+function updateStopwatchDisplay() {
+  const current = stopwatchState.elapsedMs + (stopwatchState.running ? Date.now() - stopwatchState.startedAt : 0);
+  document.getElementById("stopwatch-display").textContent = formatStopwatch(current);
+}
+function setupStopwatch() {
+  const toggleBtn = document.getElementById("stopwatch-toggle");
+  const resetBtn = document.getElementById("stopwatch-reset");
+  toggleBtn.addEventListener("click", () => {
+    if (stopwatchState.running) {
+      stopwatchState.elapsedMs += Date.now() - stopwatchState.startedAt;
+      stopwatchState.running = false;
+      clearInterval(stopwatchState.timer);
+      toggleBtn.textContent = "▶";
+      toggleBtn.setAttribute("aria-label", "Iniciar cronômetro");
+    } else {
+      stopwatchState.startedAt = Date.now();
+      stopwatchState.running = true;
+      stopwatchState.timer = setInterval(updateStopwatchDisplay, 500);
+      toggleBtn.textContent = "⏸";
+      toggleBtn.setAttribute("aria-label", "Pausar cronômetro");
+    }
+  });
+  resetBtn.addEventListener("click", () => {
+    stopwatchState.running = false;
+    stopwatchState.elapsedMs = 0;
+    clearInterval(stopwatchState.timer);
+    toggleBtn.textContent = "▶";
+    toggleBtn.setAttribute("aria-label", "Iniciar cronômetro");
+    updateStopwatchDisplay();
+  });
+}
+
 function renderMonthGoal() {
   const monthKey = monthKeyFromDayKey(toDayKey(state.calendarCursor));
   const monthLabel = formatMonthLong(monthKey);
   const goal = getMonthlyGoal(monthKey);
   const revenue = getMonthRevenue(monthKey);
+  const monthStats = computeMonthMetrics(monthKey);
+  document.getElementById("month-total-consults").textContent = String(monthStats.total);
+  document.getElementById("month-total-breakdown").textContent =
+    monthStats.total > 0
+      ? TYPE_KEYS.map((t) => `${TYPE_META[t].label}: ${monthStats.counts[t]}`).join(" | ")
+      : "Nenhum atendimento ainda";
   document.getElementById("month-goal-title").textContent = `Meta do mês (${monthLabel})`;
   document.getElementById("month-goal-achieved").textContent = `Acumulado: ${formatCurrency(revenue)}`;
   const goalValueEl = document.getElementById("month-goal-value");
@@ -497,6 +1244,37 @@ function renderMonthGoal() {
   remainingEl.textContent = remaining > 0 ? formatCurrency(remaining) : `Meta batida (+${formatCurrency(Math.abs(remaining))})`;
   const progress = goal > 0 ? (revenue / goal) * 100 : revenue > 0 ? 100 : 0;
   progressEl.textContent = `Progresso: ${progress.toFixed(1)}%`;
+}
+
+function renderAtestadoSummary() {
+  const monthKey = monthKeyFromDayKey(toDayKey(state.calendarCursor));
+  const { perType, totalCom, totalSem, totalAll } = computeMonthAtestadoSummary(monthKey);
+
+  document.getElementById("atestado-total-com").textContent = String(totalCom);
+  document.getElementById("atestado-total-sem").textContent = String(totalSem);
+  document.getElementById("atestado-total-com-hint").textContent =
+    totalAll > 0 ? `${((totalCom / totalAll) * 100).toFixed(1)}% dos atendimentos do mês` : "Sem base";
+  document.getElementById("atestado-total-sem-hint").textContent =
+    totalAll > 0 ? `${((totalSem / totalAll) * 100).toFixed(1)}% dos atendimentos do mês` : "Sem base";
+
+  const grid = document.getElementById("atestado-type-grid");
+  grid.innerHTML = "";
+  for (const type of TYPE_KEYS) {
+    const { com, sem } = perType[type];
+    const total = com + sem;
+    const rate = total > 0 ? (com / total) * 100 : null;
+    const card = document.createElement("article");
+    card.className = "atestado-type-card";
+    card.innerHTML = `
+      <p class="atestado-type-title">${TYPE_META[type].label}</p>
+      <p class="atestado-type-rate">${rate === null ? "Sem base" : `${rate.toFixed(1)}%`}</p>
+      <p class="metric-hint">com atestado</p>
+      <div class="atestado-type-divider"></div>
+      <div class="atestado-type-row"><span>Com atestado</span><strong>${com}</strong></div>
+      <div class="atestado-type-row"><span>Sem atestado</span><strong>${sem}</strong></div>
+    `;
+    grid.appendChild(card);
+  }
 }
 
 function destroyChart(key) {
@@ -596,9 +1374,12 @@ function renderAll() {
   renderConsultTypeButtons();
   const metrics = computeDayMetrics(state.selectedDateKey);
   renderMetrics(metrics);
+  renderTimeline(metrics.records);
   renderDayList(metrics.records);
   renderCalendar();
   renderMonthGoal();
+  renderSchedule();
+  renderAtestadoSummary();
   renderCharts(metrics);
   const prices = getTypePrices();
   document.getElementById("price-adulto").value = String(prices.adulto);
@@ -614,6 +1395,7 @@ function openEditRecordModal(recordId) {
   const location = findRecordLocationById(recordId);
   if (!location) return;
   state.editingRecordId = recordId;
+  document.getElementById("edit-record-name").value = location.record.name || "";
   document.getElementById("edit-record-date").value = toDayKey(new Date(location.record.ts));
   document.getElementById("edit-record-time").value = toTimeInputValue(location.record.ts);
   document.getElementById("edit-record-type").value = location.record.type;
@@ -634,6 +1416,7 @@ function saveEditedRecord() {
   const location = findRecordLocationById(state.editingRecordId);
   if (!location) { closeEditRecordModal(); return; }
 
+  const newName = document.getElementById("edit-record-name").value;
   const newDayKey = document.getElementById("edit-record-date").value;
   const newTime = document.getElementById("edit-record-time").value;
   const newType = document.getElementById("edit-record-type").value;
@@ -652,7 +1435,11 @@ function saveEditedRecord() {
     atestado: newAtestado,
     price: newPrice,
     plantaoCategory: newType === "plantao" ? getShiftCategoryForTs(newTs) : null,
+    plantaoPricingGroup: newType === "plantao" ? getShiftCategoryForTs(newTs) : null,
+    plantaoManual: false,
+    name: typeof newName === "string" ? newName.trim().slice(0, 80) : "",
   });
+  markDayDirty(newDayKey);
   if (newType === "plantao") recalcPlantaoPricingForDay(newDayKey);
   else if (oldDayKey === newDayKey) recalcPlantaoPricingForDay(newDayKey);
   if (oldDayKey !== newDayKey) recalcPlantaoPricingForDay(oldDayKey);
@@ -688,6 +1475,8 @@ async function tryRestoreSession() {
     const payload = await api("/auth/session");
     state.user = payload.user;
     state.data = normalizeData(payload.data);
+    state.dirtyDays.clear();
+    state.dirtySettings = false;
     showAppScreen();
     renderAll();
     return true;
@@ -701,6 +1490,7 @@ function normalizeData(raw) {
   base.days = raw.days && typeof raw.days === "object" ? raw.days : {};
   base.settings.typePrices = { ...base.settings.typePrices, ...(raw.settings?.typePrices || {}) };
   base.settings.monthlyGoals = raw.settings?.monthlyGoals && typeof raw.settings.monthlyGoals === "object" ? raw.settings.monthlyGoals : {};
+  base.settings.plantaoPlan = raw.settings?.plantaoPlan && typeof raw.settings.plantaoPlan === "object" ? raw.settings.plantaoPlan : {};
   return base;
 }
 
@@ -725,6 +1515,8 @@ function bindEvents() {
       const payload = await api("/auth/login", { method: "POST", body: { email, password } });
       state.user = payload.user;
       state.data = normalizeData(payload.data);
+      state.dirtyDays.clear();
+      state.dirtySettings = false;
       showAuthMessage("");
       showAppScreen();
       renderAll();
@@ -752,10 +1544,13 @@ function bindEvents() {
     try { await api("/auth/logout", { method: "POST" }); } catch (e) {}
     state.user = null;
     state.data = emptyData();
+    state.dirtyDays.clear();
+    state.dirtySettings = false;
     showAuthScreen();
   });
 
   document.getElementById("undo-btn").addEventListener("click", undoLastFromSelectedDay);
+  document.getElementById("apply-shift-override-btn").addEventListener("click", applyShiftOverrideToSelectedDay);
 
   document.getElementById("prev-month").addEventListener("click", () => {
     state.calendarCursor = new Date(state.calendarCursor.getFullYear(), state.calendarCursor.getMonth() - 1, 1);
@@ -780,6 +1575,7 @@ function bindEvents() {
       next[type] = value;
     }
     state.data.settings.typePrices = next;
+    markSettingsDirty();
     scheduleSave();
     renderAll();
   };
@@ -803,12 +1599,14 @@ function bindEvents() {
     const time = document.getElementById("manual-time").value;
     const type = document.getElementById("manual-type").value;
     const atestado = document.getElementById("manual-atestado").checked;
+    const name = document.getElementById("manual-name").value;
     if (!dayKey || !time || !TYPE_META[type]) return;
     const ts = toTimestampFromDayAndTime(dayKey, time);
-    addRecord(dayKey, ts, type, atestado);
+    addRecord(dayKey, ts, type, atestado, name);
     state.selectedDateKey = dayKey;
     state.calendarCursor = startOfMonth(parseDayKey(dayKey));
     document.getElementById("manual-atestado").checked = false;
+    document.getElementById("manual-name").value = "";
     scheduleSave();
     renderAll();
   });
@@ -823,6 +1621,27 @@ function bindEvents() {
     scheduleSave();
     renderAll();
     closeEditRecordModal();
+  });
+
+  const yearlyOverlay = document.getElementById("yearly-summary-modal");
+  document.getElementById("open-yearly-summary-btn").addEventListener("click", openYearlySummaryModal);
+  document.getElementById("close-yearly-summary-modal").addEventListener("click", closeYearlySummaryModal);
+  yearlyOverlay.addEventListener("click", (e) => { if (e.target === yearlyOverlay) closeYearlySummaryModal(); });
+  document.getElementById("yearly-summary-prev").addEventListener("click", () => {
+    state.yearlySummaryYear -= 1;
+    renderYearlySummary();
+  });
+  document.getElementById("yearly-summary-next").addEventListener("click", () => {
+    state.yearlySummaryYear += 1;
+    renderYearlySummary();
+  });
+  document.getElementById("export-month-csv").addEventListener("click", () => {
+    const monthKey = document.getElementById("export-month-select").value;
+    if (monthKey) exportMonthCSV(monthKey);
+  });
+  document.getElementById("export-month-pdf").addEventListener("click", () => {
+    const monthKey = document.getElementById("export-month-select").value;
+    if (monthKey) exportMonthPDF(monthKey);
   });
 
   const passwordOverlay = document.getElementById("password-modal");
@@ -856,18 +1675,30 @@ function bindEvents() {
   });
 
   window.addEventListener("beforeunload", () => {
-    if (state.saveTimer) {
-      // Melhor esforço: tenta enviar o último estado antes de fechar a aba.
-      navigator.sendBeacon?.(
-        "/api/data/save",
-        new Blob([JSON.stringify({ data: state.data })], { type: "application/json" })
-      );
+    if (state.saveTimer && (state.dirtyDays.size || state.dirtySettings)) {
+      // Melhor esforço: tenta enviar só as mudanças pendentes antes de fechar a aba.
+      const daysPayload = {};
+      const removedDays = [];
+      for (const dayKey of state.dirtyDays) {
+        const records = state.data.days[dayKey];
+        if (records && records.length) daysPayload[dayKey] = records;
+        else removedDays.push(dayKey);
+      }
+      const body = { days: daysPayload, removedDays };
+      if (state.dirtySettings) body.settings = state.data.settings;
+      navigator.sendBeacon?.("/api/data/save", new Blob([JSON.stringify(body)], { type: "application/json" }));
     }
   });
 }
 
 async function initApp() {
   setupThemeToggle();
+  setupPaletteToggle();
+  setupStopwatch();
+  setupTimelineNav();
+  setupDayListToggle();
+  setupShiftOverride();
+  setupScheduleControls();
   bindEvents();
   if (!(await tryRestoreSession())) showAuthScreen();
 }
